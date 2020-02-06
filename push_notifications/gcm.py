@@ -16,6 +16,18 @@ from .models import GCMDevice
 
 # Valid keys for FCM messages. Reference:
 # https://firebase.google.com/docs/cloud-messaging/http-server-ref
+
+LEGACY_FCM_TARGETS_KEYS = [
+    "to", "condition", "notification_key"
+]
+LEGACY_FCM_OPTIONS_KEYS = [
+    "collapse_key", "priority", "content_available", "delay_while_idle", "time_to_live",
+    "restricted_package_name", "dry_run"
+]
+LEGACY_FCM_NOTIFICATIONS_PAYLOAD_KEYS = [
+    "title", "body", "icon", "sound", "badge", "color", "tag", "click_action",
+    "body_loc_key", "body_loc_args", "title_loc_key", "title_loc_args", "android_channel_id"
+]
 FCM_TARGETS_KEYS = [
     "token", "condition", "topic"
 ]
@@ -122,6 +134,9 @@ def _cm_send_request(registration_ids, data, cloud_type="GCM", application_id=No
         payload = {"token": registration_ids[0]} if registration_ids else {}
     else:
         payload = {"registration_ids": registration_ids} if registration_ids else {}
+        FCM_TARGETS_KEYS = LEGACY_FCM_TARGETS_KEYS
+        FCM_OPTIONS_KEYS = LEGACY_FCM_OPTIONS_KEYS
+        FCM_NOTIFICATIONS_PAYLOAD_KEYS = LEGACY_FCM_NOTIFICATIONS_PAYLOAD_KEYS
 
     data = data.copy()
 
