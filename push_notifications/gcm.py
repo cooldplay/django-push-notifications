@@ -4,11 +4,10 @@ Previously known as GCM / C2DM
 Documentation is available on the Firebase Developer website:
 https://firebase.google.com/docs/cloud-messaging/
 """
-
+import google.auth
 import json
-
 from django.core.exceptions import ImproperlyConfigured
-
+from google.auth.transport.requests import AuthorizedSession, Request as gRequest
 from .compat import Request, urlopen
 from .conf import get_manager
 from .exceptions import NotificationError
@@ -18,15 +17,13 @@ from .models import GCMDevice
 # Valid keys for FCM messages. Reference:
 # https://firebase.google.com/docs/cloud-messaging/http-server-ref
 FCM_TARGETS_KEYS = [
-    "to", "condition", "notification_key"
+    "token", "condition", "topic"
 ]
 FCM_OPTIONS_KEYS = [
-    "collapse_key", "priority", "content_available", "delay_while_idle", "time_to_live",
-    "restricted_package_name", "dry_run"
+    "name", "data", "fcm_options"
 ]
 FCM_NOTIFICATIONS_PAYLOAD_KEYS = [
-    "title", "body", "icon", "sound", "badge", "color", "tag", "click_action",
-    "body_loc_key", "body_loc_args", "title_loc_key", "title_loc_args", "android_channel_id"
+    "title", "body", "image"
 ]
 
 
@@ -51,23 +48,31 @@ def _gcm_send(data, content_type, application_id):
         "Content-Length": str(len(data)),
     }
     request = Request(get_manager().get_post_url("GCM", application_id), data, headers)
-    return urlopen(
-        request, timeout=get_manager().get_error_timeout("GCM", application_id)
-    ).read().decode("utf-8")
+    response = urlopen(request, timeout=get_manager().get_error_timeout("GCM", application_id)).read()
+
+    return response.decode("utf-8")
 
 
-def _fcm_send(data, content_type, application_id):
+def _fcm_send(data, content_type, application_id, credentials=None):
     key = get_manager().get_fcm_api_key(application_id)
+    authorization = f"Bearer {credentials.token}" if credentials else f"key={key}"
 
     headers = {
         "Content-Type": content_type,
-        "Authorization": "key=%s" % (key),
+        "Authorization": authorization,
         "Content-Length": str(len(data)),
     }
-    request = Request(get_manager().get_post_url("FCM", application_id), data, headers)
-    return urlopen(
-        request, timeout=get_manager().get_error_timeout("FCM", application_id)
-    ).read().decode("utf-8")
+
+    if credentials:
+        data = json.loads(data)
+        authed_session = AuthorizedSession(credentials)
+        url = get_manager().get_post_url("FCM", application_id) + f'?alt=json&key={key}'
+        response = authed_session.post(url, json=data, headers=headers)
+        return response.content.decode("utf-8")
+    else:
+        request = Request(get_manager().get_post_url("FCM", application_id), data, headers)
+        response = urlopen(request, timeout=get_manager().get_error_timeout("FCM", application_id))
+        return response.read().decode('utf-8')
 
 
 def _cm_handle_response(registration_ids, response_data, cloud_type, application_id=None):
@@ -108,28 +113,22 @@ def _cm_handle_response(registration_ids, response_data, cloud_type, application
     return response
 
 
-def _cm_send_request(
-    registration_ids, data, cloud_type="GCM", application_id=None,
-    use_fcm_notifications=True, **kwargs
-):
+def _cm_send_request(registration_ids, data, cloud_type="GCM", application_id=None, use_fcm_notifications=True, credentials=None, **kwargs):
     """
     Sends a FCM or GCM notification to one or more registration_ids as json data.
     The registration_ids needs to be a list.
     """
-
-    payload = {"registration_ids": registration_ids} if registration_ids else {}
+    if credentials:
+        payload = {"token": registration_ids[0]} if registration_ids else {}
+    else:
+        payload = {"registration_ids": registration_ids} if registration_ids else {}
 
     data = data.copy()
 
-    # If using FCM, optionnally autodiscovers notification related keys
-    # https://firebase.google.com/docs/cloud-messaging/concept-options#notifications_and_data_messages
     if cloud_type == "FCM" and use_fcm_notifications:
         notification_payload = {}
         if "message" in data:
             notification_payload["body"] = data.pop("message", None)
-
-        if "fcm_options" in data:
-            payload["fcm_options"] = data.pop("fcm_options", None)
 
         for key in FCM_NOTIFICATIONS_PAYLOAD_KEYS:
             value_from_extra = data.pop(key, None)
@@ -144,26 +143,25 @@ def _cm_send_request(
     if data:
         payload["data"] = data
 
-    # Attach any additional non falsy keyword args (targets, options)
-    # See ref : https://firebase.google.com/docs/cloud-messaging/http-server-ref#table1
+    if "label" in data:
+        payload["fcmOptions"] = {'analyticsLabel': data.pop("label", None)}
+
     payload.update({
         k: v for k, v in kwargs.items() if v and (k in FCM_TARGETS_KEYS or k in FCM_OPTIONS_KEYS)
     })
 
-    # Sort the keys for deterministic output (useful for tests)
+    if credentials:
+        payload = {"validateOnly": False, "message": payload}
     json_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
     # Sends requests and handles the response
     if cloud_type == "GCM":
-        response = json.loads(_gcm_send(
-            json_payload, "application/json", application_id=application_id
-        ))
+        response = json.loads(_gcm_send(json_payload, "application/json", application_id=application_id))
     elif cloud_type == "FCM":
-        response = json.loads(_fcm_send(
-            json_payload, "application/json", application_id=application_id
-        ))
+        response = json.loads(_fcm_send(json_payload, "application/json", application_id=application_id, credentials=credentials))
     else:
         raise ImproperlyConfigured("cloud_type must be FCM or GCM not %s" % str(cloud_type))
+
     return _cm_handle_response(registration_ids, response, cloud_type, application_id)
 
 
@@ -186,6 +184,8 @@ def send_message(registration_ids, data, cloud_type, application_id=None, **kwar
     A reference of extra keyword arguments sent to the server is available here:
     https://firebase.google.com/docs/cloud-messaging/http-server-ref#table1
     """
+    credentials = None
+
     if cloud_type in ("FCM", "GCM"):
         max_recipients = get_manager().get_max_recipients(cloud_type, application_id)
     else:
@@ -199,17 +199,22 @@ def send_message(registration_ids, data, cloud_type, application_id=None, **kwar
     if not isinstance(registration_ids, list):
         registration_ids = [registration_ids] if registration_ids else None
 
+    if '/v1/' in get_manager().get_post_url("FCM", application_id):
+        credentials, _ = google.auth.default(scopes=[
+            'https://www.googleapis.com/auth/firebase.messaging',
+            'https://www.googleapis.com/auth/cloud-platform'
+        ])
+        credentials.refresh(gRequest())
+
     # FCM only allows up to 1000 reg ids per bulk message
     # https://firebase.google.com/docs/cloud-messaging/server#http-request
     if registration_ids:
         ret = []
         for chunk in _chunks(registration_ids, max_recipients):
-            ret.append(_cm_send_request(
-                chunk, data, cloud_type=cloud_type, application_id=application_id, **kwargs
-            ))
+            ret.append(_cm_send_request(chunk, data, cloud_type=cloud_type, application_id=application_id, credentials=credentials, **kwargs))
         return ret[0] if len(ret) == 1 else ret
     else:
-        return _cm_send_request(None, data, cloud_type=cloud_type, **kwargs)
+        return _cm_send_request(None, data, cloud_type=cloud_type, credentials=credentials, **kwargs)
 
 
 send_bulk_message = send_message
